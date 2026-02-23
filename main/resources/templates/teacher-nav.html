@@ -1,0 +1,49 @@
+<!-- Teacher Sidebar - included in teacher layout -->
+<header class="teacher-sidebar" th:fragment="teacherNav">
+    <div class="nav-brand-row">
+        <a th:href="@{/teacher/homepage}" class="text-decoration-none teacher-brand-link">
+            <div class="teacher-brand-logo">
+                <img th:src="@{/images/EAC_Emblem.png}" alt="EAC Emblem" />
+            </div>
+            <div class="teacher-brand-text">
+                <div class="teacher-brand-title">EMILIO AGUINALDO COLLEGE - MANILA</div>
+                <div class="teacher-brand-subtitle">
+                    1113–1117 San Marcelino St., Ermita, Manila, Philippines 1000
+                </div>
+            </div>
+        </a>
+    </div>
+
+    <div class="nav-bottom-row">
+        <nav class="teacher-nav-menu" id="teacherNavMenu">
+            <a class="teacher-nav-item" th:href="@{/teacher/homepage}" data-path="/teacher/homepage">
+                <i class="bi bi-house-door-fill"></i> Dashboard
+            </a>
+            <a class="teacher-nav-item" th:href="@{/teacher/subjects}" data-path="/teacher/subjects">
+                <i class="bi bi-collection-fill"></i> Subjects
+            </a>
+            <a class="teacher-nav-item" th:href="@{/teacher/processed-papers}" data-path="/teacher/processed-papers">
+                <i class="bi bi-journal-check"></i> Processed Papers
+            </a>
+        </nav>
+        <div class="teacher-sidebar-footer">
+            <form th:action="@{/logout}" method="post" class="d-inline">
+                <button type="submit" class="teacher-logout-btn">
+                    <i class="bi bi-box-arrow-right"></i>
+                    <span>Logout</span>
+                </button>
+            </form>
+        </div>
+        <script>
+            (function() {
+                const path = window.location.pathname;
+                document.querySelectorAll('#teacherNavMenu .teacher-nav-item').forEach(function(link) {
+                    const p = link.getAttribute('data-path');
+                    if (p && path.startsWith(p)) {
+                        link.classList.add('active');
+                    }
+                });
+            })();
+        </script>
+    </div>
+</header>

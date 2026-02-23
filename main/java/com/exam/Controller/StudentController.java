@@ -1,0 +1,1185 @@
+package com.exam.Controller;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Controller;
+import org.springframework.ui.Model;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseBody;
+
+import com.exam.entity.EnrolledStudent;
+import com.exam.entity.ExamSubmission;
+import com.exam.entity.Subject;
+import com.exam.entity.User;
+import com.exam.repository.EnrolledStudentRepository;
+import com.exam.repository.ExamSubmissionRepository;
+import com.exam.repository.SubjectRepository;
+import com.exam.repository.UserRepository;
+import com.exam.service.AnswerKeyService;
+import com.exam.service.IRT3PLService;
+import com.exam.service.RandomForestAnalyticsService;
+import com.exam.service.RandomForestService;
+
+import jakarta.servlet.http.HttpSession;
+
+@Controller
+@RequestMapping("/student")
+public class StudentController {
+
+    @Autowired
+    private RandomForestService randomForestService;
+    
+    @Autowired
+    private RandomForestAnalyticsService randomForestAnalyticsService;
+    
+    @Autowired
+    private IRT3PLService irt3PLService;
+    
+    @Autowired
+    private AnswerKeyService answerKeyService;
+    
+    @Autowired
+    private ExamSubmissionRepository examSubmissionRepository;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private EnrolledStudentRepository enrolledStudentRepository;
+    
+    @Autowired
+    private SubjectRepository subjectRepository;
+
+    // This would normally be injected from a service, but for now we'll reference the static map
+    // In production, this should be stored in database
+    private static Map<String, List<String>> getDistributedExams() {
+        // This is a workaround - in production use a service/repository
+        return com.exam.Controller.HomepageController.getDistributedExams();
+    }
+
+    @GetMapping("/dashboard")
+    public String studentDashboard(HttpSession session, Model model, java.security.Principal principal) {
+        String studentEmail = principal.getName();
+        model.addAttribute("studentEmail", studentEmail);
+        
+        // Get subjects student is enrolled in
+        List<EnrolledStudent> enrollments = enrolledStudentRepository.findByStudentEmail(studentEmail);
+        
+        // Create a map of subject data with activities
+        List<Map<String, Object>> subjectCards = new ArrayList<>();
+        
+        for (EnrolledStudent enrollment : enrollments) {
+            Long subjectId = enrollment.getSubjectId();
+            String subjectName = enrollment.getSubjectName();
+            
+            if (subjectId != null) {
+                // Get subject details
+                Optional<Subject> subjectOpt = subjectRepository.findById(subjectId);
+                
+                if (subjectOpt.isPresent()) {
+                    Subject subject = subjectOpt.get();
+                    Map<String, Object> subjectCard = new HashMap<>();
+                    subjectCard.put("id", subject.getId());
+                    subjectCard.put("name", subject.getSubjectName());
+                    subjectCard.put("description", subject.getDescription());
+                    subjectCard.put("teacherEmail", subject.getTeacherEmail());
+                    
+                    // Get activities (exams) for this subject
+                    List<Map<String, Object>> activities = new ArrayList<>();
+                    
+                    // Check all distributed assignments for this subject
+                    List<Map<String, Object>> assignmentHistory = HomepageController.getDistributedExamHistory(studentEmail);
+                    if (!assignmentHistory.isEmpty()) {
+                        for (Map<String, Object> assignment : assignmentHistory) {
+                            String examSubject = String.valueOf(assignment.getOrDefault("examSubject", ""));
+                            if (subjectName == null || !subjectName.equals(examSubject)) {
+                                continue;
+                            }
+
+                            String examName = String.valueOf(assignment.getOrDefault("examName", ""));
+                            String assignmentId = String.valueOf(assignment.getOrDefault("assignmentId", ""));
+
+                            String examActivityType = String.valueOf(assignment.getOrDefault("examActivityType", "Exam"));
+                            Object timeObj = assignment.get("examTimeLimit");
+                            int examTimeLimit = timeObj instanceof Number ? ((Number) timeObj).intValue() : 60;
+                            String examDeadline = String.valueOf(assignment.getOrDefault("examDeadline", ""));
+                            List<String> examQuestions = HomepageController.getDistributedExamQuestions(studentEmail, assignmentId);
+
+                            Map<String, Object> activity = new HashMap<>();
+                            activity.put("name", (examName != null && !examName.isBlank()) ? examName : "Untitled Exam");
+                            activity.put("type", examActivityType != null ? examActivityType : "Exam");
+                            activity.put("timeLimit", examTimeLimit);
+                            activity.put("questionCount", examQuestions != null ? examQuestions.size() : 0);
+                            activity.put("deadline", formatDeadline(examDeadline));
+                            activity.put("status", "pending");
+                            activity.put("icon", getActivityIcon(examActivityType));
+                            activity.put("color", getActivityColor(examActivityType));
+                            activity.put("startUrl", "/student/take-exam?assignmentId=" + assignmentId);
+                            activities.add(activity);
+                        }
+                    }
+                    
+                    // Get recent submissions for this subject
+                    List<ExamSubmission> subjectSubmissions = examSubmissionRepository.findByStudentEmail(studentEmail)
+                        .stream()
+                        .filter(sub -> subjectName != null && subjectName.equals(sub.getSubject()))
+                        .sorted(Comparator.comparing(ExamSubmission::getSubmittedAt, 
+                                                   Comparator.nullsLast(Comparator.reverseOrder())))
+                        .limit(3)
+                        .collect(Collectors.toList());
+                    
+                    for (ExamSubmission submission : subjectSubmissions) {
+                        Map<String, Object> activity = new HashMap<>();
+                        activity.put("name", submission.getExamName());
+                        activity.put("type", submission.getActivityType() != null ? submission.getActivityType() : "Exam");
+                        activity.put("status", "completed");
+                        activity.put("score", submission.getScore() + "/" + submission.getTotalQuestions());
+                        activity.put("percentage", submission.getPercentage());
+                        activity.put("submittedAt", submission.getSubmittedAt());
+                        activity.put("submissionId", submission.getId());
+                        activity.put("icon", getActivityIcon(submission.getActivityType()));
+                        activity.put("color", getActivityColor(submission.getActivityType()));
+                        activities.add(activity);
+                    }
+                    
+                    subjectCard.put("activities", activities);
+                    subjectCard.put("activityCount", activities.size());
+                    subjectCards.add(subjectCard);
+                }
+            }
+        }
+        
+        model.addAttribute("subjectCards", subjectCards);
+        model.addAttribute("hasSubjects", !subjectCards.isEmpty());
+        
+        // Get all submissions for history section
+        List<ExamSubmission> allSubmissions = examSubmissionRepository.findByStudentEmail(studentEmail);
+        allSubmissions.sort(Comparator.comparing(ExamSubmission::getSubmittedAt, 
+                                               Comparator.nullsLast(Comparator.reverseOrder())));
+        model.addAttribute("allSubmissions", allSubmissions);
+        model.addAttribute("hasSubmissions", !allSubmissions.isEmpty());
+        
+        return "student-dashboard";
+    }
+
+    @GetMapping("/all-attempts")
+    public String allAttempts(Model model, java.security.Principal principal) {
+        String studentEmail = principal.getName();
+        List<ExamSubmission> allSubmissions = examSubmissionRepository.findByStudentEmail(studentEmail);
+        allSubmissions.sort(Comparator.comparing(ExamSubmission::getSubmittedAt,
+                                                 Comparator.nullsLast(Comparator.reverseOrder())));
+        model.addAttribute("allSubmissions", allSubmissions);
+        model.addAttribute("hasSubmissions", !allSubmissions.isEmpty());
+        return "student-all-attempts";
+    }
+
+    private String formatDeadline(String examDeadline) {
+        if (examDeadline != null && !examDeadline.isEmpty()) {
+            try {
+                java.time.LocalDateTime deadlineDateTime = java.time.LocalDateTime.parse(examDeadline);
+                return deadlineDateTime.format(java.time.format.DateTimeFormatter.ofPattern("MMM dd, yyyy hh:mm a"));
+            } catch (Exception e) {
+                return examDeadline;
+            }
+        }
+        return "";
+    }
+    
+    private String getActivityIcon(String activityType) {
+        if (activityType == null) return "bi-file-earmark-text";
+        switch (activityType.toLowerCase()) {
+            case "assignment":
+                return "bi-journal-text";
+            case "practical exam":
+            case "practical":
+                return "bi-laptop";
+            case "quiz":
+                return "bi-question-circle";
+            default:
+                return "bi-file-earmark-text";
+        }
+    }
+    
+    private String getActivityColor(String activityType) {
+        if (activityType == null) return "primary";
+        switch (activityType.toLowerCase()) {
+            case "assignment":
+                return "success";
+            case "practical exam":
+            case "practical":
+                return "warning";
+            case "quiz":
+                return "info";
+            default:
+                return "primary";
+        }
+    }
+    
+    @GetMapping("/results/{submissionId}")
+    public String viewResults(@PathVariable Long submissionId, Model model, java.security.Principal principal) {
+        String studentId = principal.getName();
+        
+        Optional<ExamSubmission> submissionOpt = examSubmissionRepository.findById(submissionId);
+        
+        if (submissionOpt.isEmpty() || !submissionOpt.get().getStudentEmail().equals(studentId)) {
+            model.addAttribute("error", "Submission not found");
+            return "redirect:/student/dashboard";
+        }
+        
+        ExamSubmission submission = submissionOpt.get();
+        
+        // Parse answer details
+        List<Map<String, Object>> answerDetails = new ArrayList<>();
+        if (submission.getAnswerDetailsJson() != null && !submission.getAnswerDetailsJson().isEmpty()) {
+            String[] details = submission.getAnswerDetailsJson().split(";");
+            for (String detail : details) {
+                if (!detail.trim().isEmpty()) {
+                    String[] parts = detail.split("\\|");
+                    if (parts.length == 4) {
+                        Map<String, Object> detailMap = new HashMap<>();
+                        detailMap.put("questionNumber", Integer.parseInt(parts[0]));
+                        detailMap.put("studentAnswer", parts[1]);
+                        detailMap.put("correctAnswer", parts[2]);
+                        detailMap.put("isCorrect", Boolean.parseBoolean(parts[3]));
+                        answerDetails.add(detailMap);
+                    }
+                }
+            }
+        }
+        
+        // Create analytics object
+        RandomForestService.StudentAnalytics analytics = new RandomForestService.StudentAnalytics(
+            studentId,
+            submission.getTopicMastery(),
+            submission.getDifficultyResilience(),
+            submission.getAccuracy(),
+            submission.getTimeEfficiency(),
+            submission.getConfidence(),
+            submission.getPerformanceCategory()
+        );
+        
+        model.addAttribute("score", submission.getScore());
+        model.addAttribute("total", submission.getTotalQuestions());
+        model.addAttribute("percentage", submission.getPercentage());
+        model.addAttribute("answerDetails", answerDetails);
+        model.addAttribute("analytics", analytics);
+        model.addAttribute("submission", submission); // Pass full submission for grading status
+        
+        return "student-results";
+    }
+    
+    @GetMapping("/view-exam/{submissionId}")
+    public String viewExam(@PathVariable Long submissionId, Model model, java.security.Principal principal) {
+        String studentId = principal.getName();
+        
+        Optional<ExamSubmission> submissionOpt = examSubmissionRepository.findById(submissionId);
+        
+        if (submissionOpt.isEmpty() || !submissionOpt.get().getStudentEmail().equals(studentId)) {
+            model.addAttribute("error", "Submission not found");
+            return "redirect:/student/dashboard";
+        }
+        
+        ExamSubmission submission = submissionOpt.get();
+        
+        // Parse answer details to display questions and answers
+        List<Map<String, Object>> answerDetails = new ArrayList<>();
+        if (submission.getAnswerDetailsJson() != null && !submission.getAnswerDetailsJson().isEmpty()) {
+            String[] details = submission.getAnswerDetailsJson().split(";");
+            for (String detail : details) {
+                if (!detail.trim().isEmpty()) {
+                    String[] parts = detail.split("\\|");
+                    if (parts.length == 4) {
+                        Map<String, Object> detailMap = new HashMap<>();
+                        detailMap.put("questionNumber", Integer.parseInt(parts[0]));
+                        detailMap.put("studentAnswer", parts[1]);
+                        detailMap.put("correctAnswer", parts[2]);
+                        detailMap.put("isCorrect", Boolean.parseBoolean(parts[3]));
+                        answerDetails.add(detailMap);
+                    }
+                }
+            }
+        }
+        
+        model.addAttribute("submission", submission);
+        model.addAttribute("answerDetails", answerDetails);
+        
+        return "student-view-exam";
+    }
+
+    @GetMapping("/take-exam")
+    public String takeExam(@RequestParam(required = false) String assignmentId,
+                           HttpSession session,
+                           Model model,
+                           java.security.Principal principal) {
+        String studentId = principal.getName();
+        Map<String, Object> selectedAssignment = null;
+        List<Map<String, Object>> assignmentHistory = HomepageController.getDistributedExamHistory(studentId);
+
+        if (!assignmentHistory.isEmpty()) {
+            if (assignmentId != null && !assignmentId.isBlank()) {
+                for (Map<String, Object> assignment : assignmentHistory) {
+                    if (assignmentId.equals(assignment.get("assignmentId"))) {
+                        selectedAssignment = assignment;
+                        break;
+                    }
+                }
+            }
+            if (selectedAssignment == null) {
+                selectedAssignment = assignmentHistory.get(assignmentHistory.size() - 1);
+                Object chosenId = selectedAssignment.get("assignmentId");
+                assignmentId = chosenId != null ? String.valueOf(chosenId) : assignmentId;
+            }
+        }
+
+        if ((assignmentId == null || assignmentId.isBlank()) && selectedAssignment == null) {
+            model.addAttribute("error", "No exam available for you yet.");
+            return "redirect:/student/dashboard";
+        }
+
+        List<String> exam = HomepageController.getDistributedExamQuestions(studentId, assignmentId);
+        if (exam == null || exam.isEmpty()) {
+            exam = getDistributedExams().get(studentId);
+        }
+        if (exam == null || exam.isEmpty()) {
+            model.addAttribute("error", "No exam available for you yet.");
+            return "redirect:/student/dashboard";
+        }
+
+        session.setAttribute("currentAssignmentId_" + studentId, assignmentId);
+        
+        // MULTIPLE ATTEMPTS ALLOWED - Students can retake exams, all submissions stored in database
+        String examName = (String) session.getAttribute("examName_" + studentId);
+        Map<String, Object> distributedMeta = selectedAssignment != null
+            ? selectedAssignment
+            : HomepageController.getDistributedExamMetadata(studentId);
+        if ((examName == null || examName.isEmpty()) && distributedMeta != null) {
+            Object metaExamName = distributedMeta.get("examName");
+            examName = metaExamName != null ? String.valueOf(metaExamName) : null;
+        }
+        boolean isUnlocked = false;
+        
+        if (examName != null) {
+            // Check if exam is unlocked by teacher (bypasses deadline only)
+            isUnlocked = HomepageController.isExamUnlocked(studentId, examName);
+            
+            if (isUnlocked) {
+                System.out.println("🔓 UNLOCKED ACCESS: Student " + studentId + " accessing unlocked exam: " + examName);
+                System.out.println("   Bypassing deadline check");
+            }
+            
+            // Log previous submissions (informational only, not blocking)
+            List<ExamSubmission> previousSubmissions = examSubmissionRepository
+                .findByStudentEmailAndExamName(studentId, examName);
+            
+            if (!previousSubmissions.isEmpty()) {
+                System.out.println("📝 Student " + studentId + " has " + previousSubmissions.size() + 
+                                 " previous submission(s) for this exam");
+                System.out.println("   Allowing retake - all submissions will be stored");
+            }
+        }
+        
+        // Check if deadline has passed (SKIP if exam is unlocked)
+        if (!isUnlocked) {
+            String deadline = (String) session.getAttribute("examDeadline_" + studentId);
+            if ((deadline == null || deadline.isEmpty()) && distributedMeta != null) {
+                Object metaDeadline = distributedMeta.get("examDeadline");
+                deadline = metaDeadline != null ? String.valueOf(metaDeadline) : null;
+            }
+            if (deadline != null && !deadline.isEmpty()) {
+                try {
+                    java.time.LocalDateTime deadlineDateTime = java.time.LocalDateTime.parse(deadline);
+                    java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                    
+                    if (now.isAfter(deadlineDateTime)) {
+                        System.out.println("🚫 DEADLINE EXCEEDED: Student " + studentId + " tried to access exam after deadline");
+                        System.out.println("   Deadline: " + deadlineDateTime + ", Current: " + now);
+                        model.addAttribute("error", "The exam deadline has passed. You can no longer access this exam.");
+                        model.addAttribute("deadline", deadlineDateTime.format(java.time.format.DateTimeFormatter.ofPattern("MMM dd, yyyy hh:mm a")));
+                        return "student-dashboard";
+                    }
+                } catch (Exception e) {
+                    System.out.println("⚠️ Error parsing deadline: " + e.getMessage());
+                }
+            }
+        }
+        
+        // Get student information
+        Optional<User> studentOpt = userRepository.findByEmail(studentId);
+        if (studentOpt.isPresent()) {
+            User student = studentOpt.get();
+            Map<String, String> userInfo = new HashMap<>();
+            userInfo.put("fullName", student.getFullName());
+            userInfo.put("email", student.getEmail());
+            model.addAttribute("userInfo", userInfo);
+        } else {
+            Map<String, String> userInfo = new HashMap<>();
+            userInfo.put("fullName", "Student");
+            userInfo.put("email", studentId);
+            model.addAttribute("userInfo", userInfo);
+        }
+        
+        // Get exam information (subject and activity type) from session
+        Map<String, String> examInfo = new HashMap<>();
+        String subject = (String) session.getAttribute("examSubject_" + studentId);
+        String activityType = (String) session.getAttribute("examActivityType_" + studentId);
+        Integer timeLimit = (Integer) session.getAttribute("examTimeLimit_" + studentId);
+        String examDeadline = (String) session.getAttribute("examDeadline_" + studentId);
+        if (distributedMeta != null) {
+            if (subject == null || subject.isEmpty()) {
+                Object metaSubject = distributedMeta.get("examSubject");
+                subject = metaSubject != null ? String.valueOf(metaSubject) : null;
+            }
+            if (activityType == null || activityType.isEmpty()) {
+                Object metaType = distributedMeta.get("examActivityType");
+                activityType = metaType != null ? String.valueOf(metaType) : null;
+            }
+            if (timeLimit == null) {
+                Object metaTime = distributedMeta.get("examTimeLimit");
+                if (metaTime instanceof Integer) {
+                    timeLimit = (Integer) metaTime;
+                }
+            }
+            if (examDeadline == null || examDeadline.isEmpty()) {
+                Object metaDeadline = distributedMeta.get("examDeadline");
+                examDeadline = metaDeadline != null ? String.valueOf(metaDeadline) : null;
+            }
+        }
+        
+        // ALWAYS set start time to NOW when student accesses exam page (force reset)
+        // Use epoch milliseconds for reliable JavaScript Date handling
+        long startTimeMillis = System.currentTimeMillis();
+        session.setAttribute("examStartTime_" + studentId, startTimeMillis);
+        System.out.println("▶ Exam timer STARTED for " + studentId + " at: " + startTimeMillis + " (" + 
+                          java.time.Instant.ofEpochMilli(startTimeMillis).toString() + ")");
+        
+        examInfo.put("subject", subject != null ? subject : "General");
+        examInfo.put("activityType", activityType != null ? activityType : "Exam");
+        examInfo.put("timeLimit", timeLimit != null ? timeLimit.toString() : "60");
+        examInfo.put("deadline", examDeadline != null ? examDeadline : "");
+        examInfo.put("startTimeMillis", String.valueOf(startTimeMillis));
+        model.addAttribute("examInfo", examInfo);
+        
+        // Keep selected assignment metadata in session for submit flow
+        if (distributedMeta != null) {
+            session.setAttribute("examName_" + studentId, String.valueOf(distributedMeta.getOrDefault("examName", examName)));
+            session.setAttribute("examSubject_" + studentId, String.valueOf(distributedMeta.getOrDefault("examSubject", subject)));
+            session.setAttribute("examActivityType_" + studentId, String.valueOf(distributedMeta.getOrDefault("examActivityType", activityType)));
+            Object metaLimit = distributedMeta.get("examTimeLimit");
+            if (metaLimit instanceof Number numberValue) {
+                session.setAttribute("examTimeLimit_" + studentId, numberValue.intValue());
+            }
+            session.setAttribute("examDeadline_" + studentId, String.valueOf(distributedMeta.getOrDefault("examDeadline", examDeadline)));
+        }
+
+        Map<Integer, String> assignmentKey = HomepageController.getDistributedAnswerKey(studentId, assignmentId);
+        if (assignmentKey != null && !assignmentKey.isEmpty()) {
+            session.setAttribute("currentAssignmentAnswerKey_" + studentId, assignmentKey);
+        }
+
+        // Get question difficulties from assignment/session
+        @SuppressWarnings("unchecked")
+        List<String> difficulties = (List<String>) session.getAttribute("questionDifficulties_" + studentId);
+        if (difficulties == null || (assignmentId != null && !assignmentId.isBlank())) {
+            difficulties = HomepageController.getDistributedQuestionDifficulties(studentId, assignmentId);
+        }
+        if (difficulties == null) {
+            difficulties = HomepageController.getDistributedQuestionDifficulties(studentId);
+            if (difficulties != null) {
+                session.setAttribute("questionDifficulties_" + studentId, difficulties);
+            }
+        }
+        if (difficulties == null) {
+            // Generate default difficulties if not found
+            difficulties = new ArrayList<>();
+            for (int i = 0; i < exam.size(); i++) {
+                difficulties.add("Medium");
+            }
+        }
+        model.addAttribute("difficulties", difficulties);
+        
+        List<String> topics = HomepageController.getDistributedQuestionTopics(studentId, assignmentId);
+        if (topics != null) {
+            session.setAttribute("questionTopics_" + studentId, topics);
+        }
+
+        model.addAttribute("exam", exam);
+        return "student-exam-paginated";
+    }
+
+    @PostMapping("/submit")
+    public String submitExam(@RequestParam Map<String, String> answers, 
+                            HttpSession session, Model model,
+                            java.security.Principal principal) {
+        String studentId = principal != null ? principal.getName() : "guest";
+        String currentAssignmentId = (String) session.getAttribute("currentAssignmentId_" + studentId);
+        Map<String, Object> currentAssignmentMeta = HomepageController.getDistributedExamAssignmentMetadata(studentId, currentAssignmentId);
+        
+        // Check if deadline has passed (allow submission with warning if just exceeded)
+        String deadline = (String) session.getAttribute("examDeadline_" + studentId);
+        if ((deadline == null || deadline.isEmpty()) && currentAssignmentMeta != null) {
+            Object assignmentDeadline = currentAssignmentMeta.get("examDeadline");
+            deadline = assignmentDeadline != null ? String.valueOf(assignmentDeadline) : null;
+        }
+        boolean deadlineExceeded = false;
+        if (deadline != null && !deadline.isEmpty()) {
+            try {
+                java.time.LocalDateTime deadlineDateTime = java.time.LocalDateTime.parse(deadline);
+                java.time.LocalDateTime now = java.time.LocalDateTime.now();
+                
+                if (now.isAfter(deadlineDateTime)) {
+                    deadlineExceeded = true;
+                    System.out.println("⚠️ LATE SUBMISSION: Student " + studentId + " submitted after deadline");
+                    System.out.println("   Deadline: " + deadlineDateTime + ", Submitted: " + now);
+                }
+            } catch (Exception e) {
+                System.out.println("⚠️ Error parsing deadline during submission: " + e.getMessage());
+            }
+        }
+        model.addAttribute("lateSubmission", deadlineExceeded);
+        
+        // Prevent immediate auto-submit: Check if exam just started (< 10 seconds ago)
+        Object startTimeObj = session.getAttribute("examStartTime_" + studentId);
+        if (startTimeObj != null) {
+            long startTimeMillis = (Long) startTimeObj;
+            long elapsedMillis = System.currentTimeMillis() - startTimeMillis;
+            if (elapsedMillis < 10000) { // Less than 10 seconds
+                System.out.println("⚠️ BLOCKED: Exam submitted too quickly (" + elapsedMillis + "ms). Rejecting.");
+                model.addAttribute("error", "Exam cannot be submitted within 10 seconds of starting. Please wait.");
+                return "redirect:/student/take-exam";
+            }
+        }
+        
+        // Get answer key for this assignment
+        @SuppressWarnings("unchecked")
+        Map<Integer, String> key = (Map<Integer, String>) session.getAttribute("currentAssignmentAnswerKey_" + studentId);
+        if ((key == null || key.isEmpty()) && currentAssignmentId != null && !currentAssignmentId.isBlank()) {
+            key = HomepageController.getDistributedAnswerKey(studentId, currentAssignmentId);
+        }
+        if (key == null || key.isEmpty()) {
+            key = answerKeyService.getStudentAnswerKey(studentId);
+        }
+        
+        // Fallback to session if not found in service (backward compatibility)
+        if (key == null) {
+            @SuppressWarnings("unchecked")
+            Map<Integer, String> sessionKey = (Map<Integer, String>) session.getAttribute("correctAnswerKey");
+            key = sessionKey;
+        }
+        
+        // DEBUG: Console logging
+        System.out.println("\n========== EXAM GRADING DEBUG ==========");
+        System.out.println("Student: " + studentId);
+        System.out.println("Answer Key Available: " + (key != null ? "YES" : "NO"));
+        if (key != null) {
+            System.out.println("Total Questions in Answer Key: " + key.size());
+            System.out.println("Answer Key Contents:");
+            for (int i = 1; i <= key.size(); i++) {
+                System.out.println("  Q" + i + " -> " + (key.get(i) != null ? "'" + key.get(i) + "'" : "NULL"));
+            }
+        }
+        System.out.println("Student Submitted Answers: " + answers.size());
+        System.out.println("----------------------------------------");
+        
+        // Convert answers to list and calculate score
+        List<String> answerList = new ArrayList<>();
+        List<Map<String, Object>> answerDetails = new ArrayList<>();
+        int score = 0;
+        double percentage = 0;
+        RandomForestService.StudentAnalytics analytics = null;
+        
+        if (key != null) {
+            for (int i = 1; i <= key.size(); i++) {
+                String studentAns = answers.get("q" + i);
+                String correctAns = key.get(i);
+                answerList.add(studentAns != null ? studentAns : "");
+                
+                // Flexible answer matching
+                boolean isCorrect = isAnswerCorrect(studentAns, correctAns);
+                
+                if (isCorrect) {
+                    score++;
+                }
+                
+                // DEBUG: Console output
+                System.out.println("Question " + i + ":");
+                System.out.println("  Student Answer: '" + (studentAns != null ? studentAns.trim() : "NO ANSWER") + "'");
+                System.out.println("  Correct Answer: '" + (correctAns != null ? correctAns.trim() : "NOT SET") + "'");
+                System.out.println("  Result: " + (isCorrect ? "✓ CORRECT" : "✗ WRONG"));
+                System.out.println();
+                
+                // Store details for displaying on results page (when released)
+                Map<String, Object> detail = new HashMap<>();
+                detail.put("questionNumber", i);
+                detail.put("studentAnswer", studentAns != null ? studentAns.trim() : "No Answer");
+                detail.put("correctAnswer", correctAns != null ? correctAns.trim() : "Not Set");
+                detail.put("isCorrect", isCorrect);
+                answerDetails.add(detail);
+            }
+            
+            // Prevent division by zero
+            if (key.size() > 0) {
+                percentage = (score * 100.0 / key.size());
+            } else {
+                percentage = 0.0;
+                System.out.println("WARNING: Answer key is empty (0 questions)!");
+            }
+            
+            System.out.println("----------------------------------------");
+            System.out.println("FINAL SCORE: " + score + " / " + key.size());
+            System.out.println("PERCENTAGE: " + (key.size() > 0 ? "%.2f".formatted(percentage) + "%" : "N/A (no questions)"));
+            System.out.println("========================================\n");
+            
+            // Calculate Random Forest Analytics
+            try {
+                analytics = randomForestService.calculateStudentAnalytics(studentId, answerList, key, null);
+            } catch (Exception e) {
+                System.out.println("⚠️ RandomForestService analytics failed: " + e.getMessage());
+            }
+            
+            // ===============================================
+            // TRUE RANDOM FOREST ALGORITHM INTEGRATION
+            // ===============================================
+            System.out.println("\n🌲 ========== RANDOM FOREST ANALYSIS ==========");
+            
+            // Get question topics and difficulties from session
+            @SuppressWarnings("unchecked")
+            List<String> questionTopics = (List<String>) session.getAttribute("questionTopics_" + studentId);
+            @SuppressWarnings("unchecked")
+            List<String> questionDifficulties = (List<String>) session.getAttribute("questionDifficulties_" + studentId);
+            if (questionTopics == null) {
+                questionTopics = HomepageController.getDistributedQuestionTopics(studentId);
+                if (questionTopics != null) {
+                    session.setAttribute("questionTopics_" + studentId, questionTopics);
+                }
+            }
+            if (questionDifficulties == null) {
+                questionDifficulties = HomepageController.getDistributedQuestionDifficulties(studentId);
+                if (questionDifficulties != null) {
+                    session.setAttribute("questionDifficulties_" + studentId, questionDifficulties);
+                }
+            }
+            
+            // Default values if not found in session
+            if (questionTopics == null) {
+                questionTopics = new ArrayList<>();
+                for (int i = 0; i < key.size(); i++) {
+                    questionTopics.add("General");  // Default topic
+                }
+            }
+            
+            if (questionDifficulties == null) {
+                questionDifficulties = new ArrayList<>();
+                for (int i = 0; i < key.size(); i++) {
+                    // Infer difficulty from question position (first 30% easy, next 50% medium, last 20% hard)
+                    int totalQuestions = key.size();
+                    if (i < totalQuestions * 0.3) {
+                        questionDifficulties.add("Easy");
+                    } else if (i < totalQuestions * 0.8) {
+                        questionDifficulties.add("Medium");
+                    } else {
+                        questionDifficulties.add("Hard");
+                    }
+                }
+            }
+            
+            // Create a temporary submission object for feature extraction
+            ExamSubmission tempSubmission = new ExamSubmission();
+            tempSubmission.setScore(score);
+            tempSubmission.setTotalQuestions(key.size());
+            tempSubmission.setPercentage(percentage);
+            
+            // Set basic analytics from old RandomForestService (for backwards compatibility)
+            if (analytics != null) {
+                tempSubmission.setAccuracy(validateDouble(analytics.getAccuracy()));
+                tempSubmission.setTimeEfficiency(validateDouble(analytics.getTimeEfficiency()));
+                tempSubmission.setConfidence(validateDouble(analytics.getConfidence()));
+            } else {
+                // Calculate basic metrics if analytics is null
+                tempSubmission.setAccuracy(percentage);
+                tempSubmission.setTimeEfficiency(50.0);  // Default
+                tempSubmission.setConfidence(100.0);     // All questions attempted
+            }
+            
+            // Build answer details JSON for feature extraction
+            StringBuilder answerDetailsJson = new StringBuilder();
+            for (int i = 0; i < answerDetails.size(); i++) {
+                Map<String, Object> detail = answerDetails.get(i);
+                answerDetailsJson.append(detail.get("questionNumber")).append("|")
+                                .append(detail.get("studentAnswer")).append("|")
+                                .append(detail.get("correctAnswer")).append("|")
+                                .append(detail.get("isCorrect"));
+                if (i < answerDetails.size() - 1) {
+                    answerDetailsJson.append(";");
+                }
+            }
+            
+            // Extract features using TRUE Random Forest formulas
+            RandomForestAnalyticsService.StudentFeatures features = null;
+            try {
+                features = randomForestAnalyticsService.extractFeatures(
+                    tempSubmission,
+                    questionTopics,
+                    questionDifficulties,
+                    answerDetailsJson.toString()
+                );
+            } catch (Exception e) {
+                System.out.println("⚠️ Feature extraction failed: " + e.getMessage());
+            }
+            
+            // Generate comprehensive Random Forest report
+            Map<String, Object> rfReport = null;
+            try {
+                if (features != null) {
+                    rfReport = randomForestAnalyticsService.generateStudentReport(features);
+                    System.out.println("📊 FEATURE EXTRACTION:");
+                    System.out.println("   Topic Mastery (Primary): " + String.format("%.2f%%", rfReport.get("topicMasteryPrimary")));
+                    System.out.println("   Topic Mastery (Secondary): " + String.format("%.2f%%", rfReport.get("topicMasterySecondary")));
+                    System.out.println("   Topic Mastery (General): " + String.format("%.2f%%", rfReport.get("topicMasteryGeneral")));
+                    System.out.println("   Difficulty Resilience: " + String.format("%.2f%%", rfReport.get("difficultyResilience")));
+                    System.out.println("   Accuracy: " + String.format("%.2f%%", rfReport.get("accuracy")));
+                    System.out.println("   Time Efficiency: " + String.format("%.2f%%", rfReport.get("timeEfficiency")));
+                    System.out.println("   Confidence: " + String.format("%.2f%%", rfReport.get("confidence")));
+                    System.out.println("\n🎯 RANDOM FOREST PREDICTION:");
+                    System.out.println("   Overall Score: " + String.format("%.2f%%", rfReport.get("overallScore")));
+                    System.out.println("   Category: " + rfReport.get("predictedCategory"));
+                    System.out.println("   Strengths: " + rfReport.get("strengths"));
+                    System.out.println("   Weaknesses: " + rfReport.get("weaknesses"));
+                    System.out.println("   Recommendations: " + rfReport.get("recommendations"));
+                    System.out.println("==============================================\n");
+                }
+            } catch (Exception e) {
+                System.out.println("⚠️ Random Forest report generation failed, falling back to legacy analytics: " + e.getMessage());
+            }
+            
+            // Store Random Forest report in session for display
+            session.setAttribute("randomForestReport", rfReport);
+            
+            // ===============================================
+            // END RANDOM FOREST INTEGRATION
+            // ===============================================
+            
+            // Calculate IRT 3PL Ability Estimate
+            try {
+            List<Boolean> responses = new ArrayList<>();
+            for (String ans : answerList) {
+                String correct = key.get(responses.size() + 1);
+                responses.add(ans != null && correct != null && ans.trim().equalsIgnoreCase(correct.trim()));
+            }
+            
+            List<IRT3PLService.ItemParameters> itemParams = irt3PLService.generateDefaultItemParameters(key.size());
+            IRT3PLService.AbilityEstimate abilityEstimate = irt3PLService.estimateAbility(responses, itemParams);
+            
+            System.out.println("=== IRT 3PL Analysis ===");
+            System.out.println("Estimated Ability (θ): " + String.format("%.3f", abilityEstimate.getTheta()));
+            System.out.println("Standard Error: " + String.format("%.3f", abilityEstimate.getStandardError()));
+            System.out.println("Scaled Score (500±100): " + irt3PLService.thetaToScaledScore(abilityEstimate.getTheta(), 500, 100));
+            System.out.println("========================");
+            
+            // Store IRT metrics in session for display
+            session.setAttribute("irtTheta", abilityEstimate.getTheta());
+            session.setAttribute("irtScaledScore", irt3PLService.thetaToScaledScore(abilityEstimate.getTheta(), 500, 100));
+            session.setAttribute("irtStandardError", abilityEstimate.getStandardError());
+            } catch (Exception e) {
+                System.out.println("⚠️ IRT calculation failed: " + e.getMessage());
+            }
+            
+            // Save submission to database (auto-released)
+            ExamSubmission submission = new ExamSubmission();
+            submission.setStudentEmail(studentId);
+            
+            // Retrieve exam metadata from session
+            String examName = (String) session.getAttribute("examName_" + studentId);
+            String subject = (String) session.getAttribute("examSubject_" + studentId);
+            String activityType = (String) session.getAttribute("examActivityType_" + studentId);
+            Map<String, Object> submitMeta = currentAssignmentMeta != null
+                ? currentAssignmentMeta
+                : HomepageController.getDistributedExamMetadata(studentId);
+            if (submitMeta != null) {
+                if (examName == null || examName.isEmpty()) {
+                    Object metaExamName = submitMeta.get("examName");
+                    examName = metaExamName != null ? String.valueOf(metaExamName) : null;
+                }
+                if (subject == null || subject.isEmpty()) {
+                    Object metaSubject = submitMeta.get("examSubject");
+                    subject = metaSubject != null ? String.valueOf(metaSubject) : null;
+                }
+                if (activityType == null || activityType.isEmpty()) {
+                    Object metaType = submitMeta.get("examActivityType");
+                    activityType = metaType != null ? String.valueOf(metaType) : null;
+                }
+            }
+            
+            submission.setExamName(examName != null ? examName : "General Exam");
+            submission.setSubject(subject != null ? subject : "General");
+            submission.setActivityType(activityType != null ? activityType : "Exam");
+            submission.setScore(score);
+            submission.setTotalQuestions(key.size());
+            submission.setPercentage(percentage);
+            submission.setResultsReleased(true); // AUTO-RELEASE: Both teacher and student can see
+            submission.setSubmittedAt(LocalDateTime.now());
+            submission.setReleasedAt(LocalDateTime.now()); // Released immediately
+            
+            // Store TRUE RANDOM FOREST analytics (validate to prevent NaN values)
+            if (rfReport != null) {
+                submission.setTopicMastery(validateDouble((Double) rfReport.get("topicMasteryGeneral")));
+                submission.setDifficultyResilience(validateDouble((Double) rfReport.get("difficultyResilience")));
+                submission.setAccuracy(validateDouble((Double) rfReport.get("accuracy")));
+                submission.setTimeEfficiency(validateDouble((Double) rfReport.get("timeEfficiency")));
+                submission.setConfidence(validateDouble((Double) rfReport.get("confidence")));
+                submission.setPerformanceCategory((String) rfReport.get("predictedCategory"));
+            } else if (analytics != null) {
+                // Fallback to old analytics if Random Forest report failed
+                submission.setTopicMastery(validateDouble(analytics.getTopicMastery()));
+                submission.setDifficultyResilience(validateDouble(analytics.getDifficultyResilience()));
+                submission.setAccuracy(validateDouble(analytics.getAccuracy()));
+                submission.setTimeEfficiency(validateDouble(analytics.getTimeEfficiency()));
+                submission.setConfidence(validateDouble(analytics.getConfidence()));
+                submission.setPerformanceCategory(analytics.getPerformanceCategory());
+            }
+            
+            // Store answer details as simple string (can be JSON later)
+            StringBuilder detailsStr = new StringBuilder();
+            for (Map<String, Object> detail : answerDetails) {
+                detailsStr.append(detail.get("questionNumber")).append("|")
+                         .append(detail.get("studentAnswer")).append("|")
+                         .append(detail.get("correctAnswer")).append("|")
+                         .append(detail.get("isCorrect")).append(";");
+            }
+            submission.setAnswerDetailsJson(detailsStr.toString());
+            
+            ExamSubmission savedSubmission;
+            try {
+                savedSubmission = examSubmissionRepository.save(submission);
+                System.out.println("Submission saved to database. Results automatically available.");
+            } catch (Exception e) {
+                System.out.println("❌ DB save failed: " + e.getMessage());
+                e.printStackTrace();
+                model.addAttribute("error", "Failed to save submission: " + e.getMessage());
+                return "redirect:/student/dashboard";
+            }
+            
+            // Remove unlock status after successful submission (lock exam again)
+            String submittedExamName = (String) session.getAttribute("examName_" + studentId);
+            if (submittedExamName != null) {
+                HomepageController.removeUnlock(studentId, submittedExamName);
+                System.out.println("🔒 EXAM RE-LOCKED after submission: " + submittedExamName + " for " + studentId);
+            }
+
+            // Remove only the submitted assignment from distributed exams
+            HomepageController.removeDistributedExam(studentId, currentAssignmentId);
+            System.out.println("🗑️ ASSIGNMENT REMOVED from distributed list for student: " + studentId + " | assignmentId=" + currentAssignmentId);
+
+            session.removeAttribute("currentAssignmentId_" + studentId);
+            session.removeAttribute("currentAssignmentAnswerKey_" + studentId);
+            
+            // Store results in session for display after redirect
+            session.setAttribute("lastSubmissionId", savedSubmission.getId());
+            session.setAttribute("lastScore", score);
+            session.setAttribute("lastTotal", key.size());
+            session.setAttribute("lastPercentage", percentage);
+            session.setAttribute("lastAnswerDetails", answerDetails);
+            session.setAttribute("lastAnalytics", analytics);
+            
+            // Redirect to avoid form resubmission (Post-Redirect-Get pattern)
+            return "redirect:/student/submission-success";
+            
+        } else {
+            System.out.println("ERROR: No answer key found for student " + studentId);
+            System.out.println("========================================\n");
+            model.addAttribute("error", "No answer key available for grading.");
+            return "redirect:/student/dashboard";
+        }
+    }
+    
+    /**
+     * Display submission success page (after redirect from POST submit)
+     */
+    @GetMapping("/submission-success")
+    public String submissionSuccess(HttpSession session, Model model) {
+        // Retrieve results from session
+        Long submissionId = (Long) session.getAttribute("lastSubmissionId");
+        Integer score = (Integer) session.getAttribute("lastScore");
+        Integer total = (Integer) session.getAttribute("lastTotal");
+        Double percentage = (Double) session.getAttribute("lastPercentage");
+        
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> answerDetails = (List<Map<String, Object>>) session.getAttribute("lastAnswerDetails");
+        RandomForestService.StudentAnalytics analytics = 
+            (RandomForestService.StudentAnalytics) session.getAttribute("lastAnalytics");
+        
+        // If no session data, redirect to dashboard
+        if (score == null) {
+            return "redirect:/student/dashboard";
+        }
+        
+        // Retrieve the submission object for grading status
+        ExamSubmission submission = null;
+        if (submissionId != null) {
+            submission = examSubmissionRepository.findById(submissionId).orElse(null);
+        }
+        
+        model.addAttribute("score", score);
+        model.addAttribute("total", total);
+        model.addAttribute("percentage", percentage);
+        model.addAttribute("answerDetails", answerDetails);
+        model.addAttribute("analytics", analytics);
+        model.addAttribute("submission", submission);  // Pass submission for grading status
+        
+        // Clear session data after displaying
+        session.removeAttribute("lastSubmissionId");
+        session.removeAttribute("lastScore");
+        session.removeAttribute("lastTotal");
+        session.removeAttribute("lastPercentage");
+        session.removeAttribute("lastAnswerDetails");
+        session.removeAttribute("lastAnalytics");
+        
+        return "student-results";
+    }
+    
+    /**
+     * Validate double values to prevent NaN or Infinity from being saved to database
+     */
+    private double validateDouble(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return 0.0; // Return default value instead of NaN/Infinity
+        }
+        return value;
+    }
+    
+    /**
+     * Flexible answer matching that supports:
+     * 1. Exact match (case-insensitive)
+     * 2. Multiple-choice letter answers (A, B, C, D)
+     * 3. Text answers with partial matching for open-ended questions
+     */
+    private boolean isAnswerCorrect(String studentAnswer, String correctAnswer) {
+        if (studentAnswer == null || correctAnswer == null) {
+            return false;
+        }
+        
+        String student = studentAnswer.trim();
+        String correct = correctAnswer.trim();
+        
+        // Empty answer is wrong
+        if (student.isEmpty()) {
+            return false;
+        }
+        
+        // Exact match (case-insensitive)
+        if (student.equalsIgnoreCase(correct)) {
+            return true;
+        }
+        
+        // For single-letter answers (A, B, C, D) - exact match only
+        if (correct.length() == 1 && correct.matches("[A-Da-d]")) {
+            return student.equalsIgnoreCase(correct);
+        }
+        
+        // For text answers, check if student answer contains key terms from correct answer
+        // Normalize: remove punctuation, lowercase, split into words
+        String[] correctWords = correct.toLowerCase()
+            .replaceAll("[^a-z0-9\\s]", "")
+            .split("\\s+");
+        String studentLower = student.toLowerCase()
+            .replaceAll("[^a-z0-9\\s]", "");
+        
+        // If correct answer has multiple key words, check if student answer contains most of them
+        if (correctWords.length >= 3) {
+            int matchCount = 0;
+            for (String word : correctWords) {
+                if (word.length() > 2 && studentLower.contains(word)) {
+                    matchCount++;
+                }
+            }
+            // Accept if student got at least 70% of key words
+            return matchCount >= (correctWords.length * 0.7);
+        }
+        
+        // For shorter answers, require exact or very close match
+        return false;
+    }
+    
+    /**
+     * API endpoint for fetching student analytics (for AJAX calls)
+     */
+    @PostMapping("/api/student-analytics")
+    @ResponseBody
+    public Map<String, Object> getStudentAnalytics(HttpSession session) {
+        RandomForestService.StudentAnalytics analytics = 
+            (RandomForestService.StudentAnalytics) session.getAttribute("studentAnalytics");
+        
+        Map<String, Object> response = new HashMap<>();
+        
+        if (analytics != null) {
+            response.put("topicMastery", analytics.getTopicMastery());
+            response.put("difficultyResilience", analytics.getDifficultyResilience());
+            response.put("accuracy", analytics.getAccuracy());
+            response.put("timeEfficiency", analytics.getTimeEfficiency());
+            response.put("confidence", analytics.getConfidence());
+            response.put("performanceCategory", analytics.getPerformanceCategory());
+            
+            // Add historical data
+            List<RandomForestService.HistoricalPerformance> history = 
+                randomForestService.getHistoricalData(analytics.getStudentId());
+            
+            List<String> dates = new ArrayList<>();
+            List<Double> scores = new ArrayList<>();
+            for (RandomForestService.HistoricalPerformance h : history) {
+                dates.add(h.getExamName());
+                scores.add(h.getScore());
+            }
+            
+            Map<String, Object> historicalData = new HashMap<>();
+            historicalData.put("dates", dates);
+            historicalData.put("scores", scores);
+            response.put("historicalData", historicalData);
+        } else {
+            // Return default values if no analytics available
+            response.put("topicMastery", 0);
+            response.put("difficultyResilience", 0);
+            response.put("accuracy", 0);
+            response.put("timeEfficiency", 0);
+            response.put("confidence", 0);
+            response.put("performanceCategory", "No Data");
+        }
+        
+        return response;
+    }
+    
+    /**
+     * Display Random Forest Performance Analytics for a specific submission
+     */
+    @GetMapping("/performance-analytics/{submissionId}")
+    public String viewPerformanceAnalytics(@PathVariable Long submissionId, Model model, java.security.Principal principal) {
+        String studentId = principal.getName();
+        
+        // Fetch the submission
+        Optional<ExamSubmission> submissionOpt = examSubmissionRepository.findById(submissionId);
+        
+        if (submissionOpt.isEmpty() || !submissionOpt.get().getStudentEmail().equals(studentId)) {
+            model.addAttribute("error", "Submission not found or access denied");
+            return "redirect:/student/dashboard";
+        }
+        
+        ExamSubmission submission = submissionOpt.get();
+        
+        // Add submission to model
+        model.addAttribute("submission", submission);
+        
+        // Calculate strengths and weaknesses
+        List<String> strengths = new ArrayList<>();
+        List<String> weaknesses = new ArrayList<>();
+        
+        if (submission.getTopicMastery() >= 70) strengths.add("Topic Mastery");
+        else weaknesses.add("Topic Mastery");
+        
+        if (submission.getDifficultyResilience() >= 70) strengths.add("Difficulty Resilience");
+        else weaknesses.add("Difficulty Resilience");
+        
+        if (submission.getAccuracy() >= 70) strengths.add("Accuracy");
+        else weaknesses.add("Accuracy");
+        
+        if (submission.getTimeEfficiency() >= 70) strengths.add("Time Efficiency");
+        else weaknesses.add("Time Efficiency");
+        
+        if (submission.getConfidence() >= 70) strengths.add("Confidence");
+        else weaknesses.add("Confidence");
+        
+        model.addAttribute("strengths", strengths);
+        model.addAttribute("weaknesses", weaknesses);
+        
+        // Generate personalized recommendations
+        List<String> recommendations = generateRecommendations(submission);
+        model.addAttribute("recommendations", recommendations);
+        
+        // Calculate overall performance
+        double overallScore = (submission.getTopicMastery() + 
+                               submission.getDifficultyResilience() + 
+                               submission.getAccuracy() + 
+                               submission.getTimeEfficiency() + 
+                               submission.getConfidence()) / 5.0;
+        model.addAttribute("overallScore", String.format("%.2f", overallScore));
+        
+        // Determine performance message
+        String performanceMessage;
+        if (overallScore >= 80) {
+            performanceMessage = "Excellent performance! You're demonstrating strong mastery across all dimensions.";
+        } else if (overallScore >= 60) {
+            performanceMessage = "Good work! Focus on improving weak areas to reach excellent performance.";
+        } else {
+            performanceMessage = "Keep practicing! Review the recommendations below to improve your skills.";
+        }
+        model.addAttribute("performanceMessage", performanceMessage);
+        
+        System.out.println("📊 Displaying performance analytics for submission: " + submissionId);
+        System.out.println("   Overall Score: " + String.format("%.2f", overallScore));
+        System.out.println("   Category: " + submission.getPerformanceCategory());
+        System.out.println("   Strengths: " + strengths);
+        System.out.println("   Weaknesses: " + weaknesses);
+        
+        return "student-performance-analytics";
+    }
+    
+    /**
+     * Generate personalized recommendations based on performance
+     */
+    private List<String> generateRecommendations(ExamSubmission submission) {
+        List<String> recommendations = new ArrayList<>();
+        
+        // Topic Mastery recommendations
+        if (submission.getTopicMastery() < 70) {
+            recommendations.add("Review fundamental concepts in " + submission.getExamName() + " topics");
+            recommendations.add("Create concept maps to visualize relationships between topics");
+        }
+        
+        // Difficulty Resilience recommendations
+        if (submission.getDifficultyResilience() < 70) {
+            recommendations.add("Practice solving harder problems to build resilience");
+            recommendations.add("Don't skip challenging questions - use them as learning opportunities");
+        }
+        
+        // Accuracy recommendations
+        if (submission.getAccuracy() < 70) {
+            recommendations.add("Double-check your answers before submitting");
+            recommendations.add("Focus on understanding concepts rather than memorization");
+        }
+        
+        // Time Efficiency recommendations
+        if (submission.getTimeEfficiency() < 70) {
+            recommendations.add("Practice time management with timed mock exams");
+            recommendations.add("Identify and skip difficult questions initially, return to them later");
+        }
+        
+        // Confidence recommendations
+        if (submission.getConfidence() < 70) {
+            recommendations.add("Build confidence through regular practice and review");
+            recommendations.add("Join study groups to discuss challenging concepts");
+        }
+        
+        // Add positive reinforcement if performance is good
+        if (submission.getTopicMastery() >= 70 && submission.getAccuracy() >= 70) {
+            recommendations.add("Keep up the great work! Your solid foundation will serve you well");
+        }
+        
+        // If no weaknesses found, add general encouragement
+        if (recommendations.isEmpty()) {
+            recommendations.add("Excellent work! Continue challenging yourself with advanced topics");
+            recommendations.add("Consider helping peers to reinforce your understanding");
+            recommendations.add("Explore related topics to broaden your knowledge base");
+        }
+        
+        return recommendations;
+    }
+}
